@@ -1,15 +1,42 @@
 --[[ Bsj Hub | Gunung Sumbing | WindUI ]]
 
-if getgenv and getgenv().BsjHubLoaded then
-    warn("Bsj Hub sudah berjalan")
-    return
+----------------------------------------------------------------
+-- BOOT: bersihkan versi lama, siapkan token
+----------------------------------------------------------------
+local G = (getgenv and getgenv()) or _G
+if G.BsjCleanup then pcall(G.BsjCleanup) end
+
+local token = {}
+G.BsjToken = token
+local function alive() return G.BsjToken == token end
+
+local conns = {}
+local function track(c) table.insert(conns, c) return c end
+
+local function loop(interval, fn)
+    task.spawn(function()
+        local warned = false
+        while alive() do
+            task.wait(interval)
+            local ok, err = pcall(fn)
+            if not ok and not warned then
+                warned = true
+                warn("[BsjHub] " .. tostring(err))
+            end
+        end
+    end)
 end
-if getgenv then getgenv().BsjHubLoaded = true end
 
 ----------------------------------------------------------------
 -- SERVICES
 ----------------------------------------------------------------
-local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+local okUI, WindUI = pcall(function()
+    return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+end)
+if not okUI or not WindUI then
+    warn("[BsjHub] Gagal memuat WindUI: " .. tostring(WindUI))
+    return
+end
 
 local Players         = game:GetService("Players")
 local UIS             = game:GetService("UserInputService")
@@ -38,6 +65,9 @@ local S = {
 
 local dmgLog, remoteLog = {}, {}
 local origVolume = setmetatable({}, { __mode = "k" })
+
+G.BsjS = S
+G.BsjRemoteLog = remoteLog
 
 ----------------------------------------------------------------
 -- UTIL
@@ -86,14 +116,15 @@ end
 ----------------------------------------------------------------
 -- MOVEMENT
 ----------------------------------------------------------------
-UIS.JumpRequest:Connect(function()
+track(UIS.JumpRequest:Connect(function()
     if S.move.infJump then
         local hum = getHumanoid()
         if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
     end
-end)
+end))
 
-RunService.Heartbeat:Connect(function()
+track(RunService.Heartbeat:Connect(function()
+    if not alive() then return end
     local hum, hrp = getHumanoid(), getRoot()
     if not hum or not hrp then return end
 
@@ -114,11 +145,10 @@ RunService.Heartbeat:Connect(function()
     if S.move.fovOn and workspace.CurrentCamera then
         workspace.CurrentCamera.FieldOfView = S.move.fov
     end
-end)
+end))
 
--- Noclip
-RunService.Stepped:Connect(function()
-    if not S.move.noclip then return end
+track(RunService.Stepped:Connect(function()
+    if not alive() or not S.move.noclip then return end
     local c = lp.Character
     if not c then return end
     for _, p in ipairs(c:GetDescendants()) do
@@ -126,19 +156,16 @@ RunService.Stepped:Connect(function()
             p.CanCollide = false
         end
     end
-end)
+end))
 
 ----------------------------------------------------------------
--- SURVIVAL (freeze lapar, haus, suhu)
+-- SURVIVAL: freeze lapar / haus / suhu (tampilan client)
 ----------------------------------------------------------------
-task.spawn(function()
-    while true do
-        task.wait(0.2)
-        local h, t, tp = getCond("Hunger"), getCond("Thirst"), getCond("Temperature")
-        if S.survive.hunger and h then h.Value = 100 end
-        if S.survive.thirst and t then t.Value = 100 end
-        if S.weather.freezeTemp and tp then tp.Value = S.weather.temp end
-    end
+loop(0.2, function()
+    local h, t, tp = getCond("Hunger"), getCond("Thirst"), getCond("Temperature")
+    if S.survive.hunger and h then h.Value = 100 end
+    if S.survive.thirst and t then t.Value = 100 end
+    if S.weather.freezeTemp and tp then tp.Value = S.weather.temp end
 end)
 
 ----------------------------------------------------------------
@@ -147,8 +174,7 @@ end)
 local busy = false
 
 local function findItem(animName)
-    local char, bp = lp.Character, lp:FindFirstChild("Backpack")
-    for _, container in ipairs({ char, bp }) do
+    for _, container in ipairs({ lp.Character, lp:FindFirstChild("Backpack") }) do
         if container then
             for _, tool in ipairs(container:GetChildren()) do
                 if tool:IsA("Tool") and tool:FindFirstChild(animName, true) then
@@ -163,49 +189,44 @@ local function useItem(tool)
     local hum = getHumanoid()
     if not hum or hum.Health <= 0 or not tool then return end
     busy = true
-    hum:EquipTool(tool)
-    task.wait(0.4)
-    pcall(function() tool:Activate() end)
-    task.wait(2.5)
-    pcall(function() hum:UnequipTools() end)
+    pcall(function()
+        hum:EquipTool(tool)
+        task.wait(0.4)
+        tool:Activate()
+        task.wait(2.5)
+        hum:UnequipTools()
+    end)
     busy = false
 end
 
-task.spawn(function()
-    while true do
-        task.wait(1)
-        if not busy then
-            local h, t = getCond("Hunger"), getCond("Thirst")
-            if S.auto.eat and h and h.Value < S.auto.threshold then
-                useItem(findItem("EatAnim"))
-            elseif S.auto.drink and t and t.Value < S.auto.threshold then
-                useItem(findItem("DrinkAnim"))
-            end
-        end
+loop(1, function()
+    if busy then return end
+    local h, t = getCond("Hunger"), getCond("Thirst")
+    if S.auto.eat and h and h.Value < S.auto.threshold then
+        useItem(findItem("EatAnim"))
+    elseif S.auto.drink and t and t.Value < S.auto.threshold then
+        useItem(findItem("DrinkAnim"))
     end
 end)
 
 ----------------------------------------------------------------
 -- ANTI DINGIN
 ----------------------------------------------------------------
-task.spawn(function()
-    local hooked
-    while true do
-        task.wait(0.1)
-        local t = getCond("Temperature")
-        if t then
+local hookedTemp, tempConn
+loop(0.1, function()
+    local t = getCond("Temperature")
+    if not t then return end
+    if S.anti.cold and t.Value < S.anti.minTemp then
+        t.Value = S.anti.minTemp
+    end
+    if t ~= hookedTemp then
+        hookedTemp = t
+        if tempConn then tempConn:Disconnect() end
+        tempConn = track(t:GetPropertyChangedSignal("Value"):Connect(function()
             if S.anti.cold and t.Value < S.anti.minTemp then
                 t.Value = S.anti.minTemp
             end
-            if t ~= hooked then
-                hooked = t
-                t:GetPropertyChangedSignal("Value"):Connect(function()
-                    if S.anti.cold and t.Value < S.anti.minTemp then
-                        t.Value = S.anti.minTemp
-                    end
-                end)
-            end
-        end
+        end))
     end
 end)
 
@@ -223,47 +244,46 @@ local function muteSound(snd, mute)
 end
 
 local rainWasOn = false
-task.spawn(function()
-    while true do
-        task.wait(0.5)
+loop(0.5, function()
+    local rainOff = S.weather.noRain
+    local rain = lp.PlayerScripts:FindFirstChild("Rain")
 
-        local rainOff = S.weather.noRain
-        local rain = lp.PlayerScripts:FindFirstChild("Rain")
-
-        if rainOff then
-            local amt = rain and rain:FindFirstChild("Settings") and rain.Settings:FindFirstChild("Rain Amount")
-            if amt then amt.Value = 0 end
-            for _, n in ipairs({ "Rain", "TorchRain" }) do
-                setConnections(RS:FindFirstChild(n), false)
-            end
-        elseif rainWasOn then
-            for _, n in ipairs({ "Rain", "TorchRain" }) do
-                setConnections(RS:FindFirstChild(n), true)
-            end
+    if rainOff then
+        local settings = rain and rain:FindFirstChild("Settings")
+        local amt = settings and settings:FindFirstChild("Rain Amount")
+        if amt then amt.Value = 0 end
+        for _, n in ipairs({ "Rain", "TorchRain" }) do
+            setConnections(RS:FindFirstChild(n), false)
         end
+    elseif rainWasOn then
+        for _, n in ipairs({ "Rain", "TorchRain" }) do
+            setConnections(RS:FindFirstChild(n), true)
+        end
+    end
 
-        if rainOff or rainWasOn then
-            local rs = rain and rain:FindFirstChild("Sounds")
-            local rsnd = rs and rs:FindFirstChild("Rain")
-            if rsnd then muteSound(rsnd, rainOff) end
+    if rainOff or rainWasOn then
+        local sounds = rain and rain:FindFirstChild("Sounds")
+        local rsnd = sounds and sounds:FindFirstChild("Rain")
+        if rsnd then muteSound(rsnd, rainOff) end
 
-            local main = lp.PlayerGui:FindFirstChild("MainFrame")
-            local amb = main and main:FindFirstChild("AmbientWeather", true)
-            if amb then
-                for _, snd in ipairs(amb:GetChildren()) do
-                    if snd:IsA("Sound") then muteSound(snd, rainOff) end
-                end
+        local main = lp.PlayerGui:FindFirstChild("MainFrame")
+        local amb = main and main:FindFirstChild("AmbientWeather", true)
+        if amb then
+            for _, snd in ipairs(amb:GetChildren()) do
+                if snd:IsA("Sound") then muteSound(snd, rainOff) end
             end
         end
-        rainWasOn = rainOff
+    end
+    rainWasOn = rainOff
 
-        if S.weather.forceClear then
-            local cs = RS:FindFirstChild("CuacaSaatIni")
-            if cs and cs.Value ~= "Terang" then cs.Value = "Terang" end
-        end
+    if S.weather.forceClear then
+        local cs = RS:FindFirstChild("CuacaSaatIni")
+        if cs and cs.Value ~= "Terang" then cs.Value = "Terang" end
+    end
 
+    if S.weather.hideDmg then
         local di = lp.PlayerGui:FindFirstChild("DamageIndicator")
-        if di and S.weather.hideDmg then di.Enabled = false end
+        if di then di.Enabled = false end
     end
 end)
 
@@ -272,21 +292,22 @@ local function applyHypoBlock(on)
 end
 
 ----------------------------------------------------------------
--- PROTEKSI UMUM
+-- PROTEKSI
 ----------------------------------------------------------------
 local function setupCharacter(char)
-    local hum = char:WaitForChild("Humanoid")
+    local hum = char:WaitForChild("Humanoid", 10)
+    if not hum then return end
     local last = hum.Health
 
     hum.HealthChanged:Connect(function(hp)
+        if not alive() then return end
         if hp < last then
             local t, cs = getCond("Temperature"), RS:FindFirstChild("CuacaSaatIni")
-            local recent = #remoteLog > 0 and table.concat(remoteLog, ",") or "-"
             pushLog(dmgLog, ("-%.1f HP | suhu=%s | cuaca=%s | remote=%s"):format(
                 last - hp,
                 t and tostring(t.Value) or "?",
                 cs and tostring(cs.Value) or "?",
-                recent))
+                #remoteLog > 0 and table.concat(remoteLog, ",") or "-"))
             if S.anti.god and hum.Health > 0 then
                 hum.Health = hum.MaxHealth
             end
@@ -296,45 +317,49 @@ local function setupCharacter(char)
 end
 
 if lp.Character then task.spawn(setupCharacter, lp.Character) end
-lp.CharacterAdded:Connect(setupCharacter)
+track(lp.CharacterAdded:Connect(setupCharacter))
 
-task.spawn(function()
-    local states = {
-        Enum.HumanoidStateType.FallingDown,
-        Enum.HumanoidStateType.Ragdoll,
-        Enum.HumanoidStateType.PlatformStanding,
-    }
-    while true do
-        task.wait(0.5)
-        local hum = getHumanoid()
-        if hum then
-            for _, st in ipairs(states) do
-                pcall(function() hum:SetStateEnabled(st, not S.anti.noRagdoll) end)
-            end
-            if S.anti.god then hum.Health = math.max(hum.Health, 1) end
-        end
-    end
-end)
+local ragdollStates = {
+    Enum.HumanoidStateType.FallingDown,
+    Enum.HumanoidStateType.Ragdoll,
+    Enum.HumanoidStateType.PlatformStanding,
+}
 
-local blockWords = { "damage", "dmg", "hurt", "fall", "harm", "hit" }
-local function isDamageRemote(name)
-    name = name:lower()
-    for _, w in ipairs(blockWords) do
-        if name:find(w, 1, true) then return true end
+local function applyRagdoll(on)
+    local hum = getHumanoid()
+    if not hum then return end
+    for _, st in ipairs(ragdollStates) do
+        pcall(function() hum:SetStateEnabled(st, not on) end)
     end
-    return false
 end
 
-if hookmetamethod and getnamecallmethod then
+loop(1, function()
+    if S.anti.noRagdoll then applyRagdoll(true) end
+end)
+
+-- Hook FireServer (dipasang sekali, state dibaca dari G)
+G.BsjDamageWords = { "damage", "dmg", "hurt", "harm", "fall" }
+if hookmetamethod and getnamecallmethod and not G.BsjHookInstalled then
+    G.BsjHookInstalled = true
     local old
-    old = hookmetamethod(game, "__namecall", function(self, ...)
-        if getnamecallmethod() == "FireServer" and typeof(self) == "Instance" then
+    old = hookmetamethod(game, "__namecall", (newcclosure or function(f) return f end)(function(self, ...)
+        local st = G.BsjS
+        if st and getnamecallmethod() == "FireServer" and typeof(self) == "Instance" then
             local n = self.Name
-            if n ~= "DeviceHandler" then pushLog(remoteLog, n, 5) end
-            if S.anti.blockRemote and isDamageRemote(n) then return end
+            local log = G.BsjRemoteLog
+            if log and n ~= "DeviceHandler" then
+                table.insert(log, n)
+                if #log > 5 then table.remove(log, 1) end
+            end
+            if st.anti.blockRemote then
+                local low = n:lower()
+                for _, w in ipairs(G.BsjDamageWords) do
+                    if low:find(w, 1, true) then return end
+                end
+            end
         end
         return old(self, ...)
-    end)
+    end))
 end
 
 local function copyDmgLog()
@@ -344,43 +369,39 @@ local function copyDmgLog()
 end
 
 -- Anti AFK
-lp.Idled:Connect(function()
+track(lp.Idled:Connect(function()
     if not S.anti.afk then return end
     pcall(function()
         local vu = game:GetService("VirtualUser")
         vu:CaptureController()
         vu:ClickButton2(Vector2.new())
     end)
-end)
+end))
 
 ----------------------------------------------------------------
--- VISUAL: FULLBRIGHT & ESP
+-- VISUAL
 ----------------------------------------------------------------
-local origLight = {
-    Brightness = Lighting.Brightness,
-    ClockTime = Lighting.ClockTime,
-    FogEnd = Lighting.FogEnd,
-    GlobalShading = Lighting.GlobalShading,
-    Ambient = Lighting.Ambient,
-}
+local origLight = {}
+for _, k in ipairs({ "Brightness", "ClockTime", "FogEnd", "GlobalShadows", "Ambient" }) do
+    pcall(function() origLight[k] = Lighting[k] end)
+end
 
 local function setFullbright(on)
     if on then
-        Lighting.Brightness = 2
-        Lighting.ClockTime = 14
-        Lighting.FogEnd = 1e6
-        Lighting.GlobalShading = false
-        Lighting.Ambient = Color3.fromRGB(170, 170, 170)
+        pcall(function()
+            Lighting.Brightness = 2
+            Lighting.ClockTime = 14
+            Lighting.FogEnd = 1e6
+            Lighting.GlobalShadows = false
+            Lighting.Ambient = Color3.fromRGB(170, 170, 170)
+        end)
     else
         for k, v in pairs(origLight) do pcall(function() Lighting[k] = v end) end
     end
 end
 
-task.spawn(function()
-    while true do
-        task.wait(1)
-        if S.visual.fullbright then setFullbright(true) end
-    end
+loop(1, function()
+    if S.visual.fullbright then setFullbright(true) end
 end)
 
 local espObjects = {}
@@ -390,30 +411,30 @@ local function clearEsp()
     table.clear(espObjects)
 end
 
-task.spawn(function()
-    while true do
-        task.wait(1)
-        if S.visual.esp then
-            for _, p in ipairs(Players:GetPlayers()) do
-                if p ~= lp and p.Character and not espObjects[p] then
-                    local h = Instance.new("Highlight")
-                    h.FillColor = Color3.fromRGB(255, 80, 80)
-                    h.FillTransparency = 0.6
-                    h.OutlineColor = Color3.new(1, 1, 1)
-                    h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-                    h.Adornee = p.Character
-                    h.Parent = p.Character
-                    espObjects[p] = h
-                end
-            end
-            for p, h in pairs(espObjects) do
-                if not p.Parent or not p.Character or h.Adornee ~= p.Character then
-                    pcall(function() h:Destroy() end)
-                    espObjects[p] = nil
-                end
-            end
-        elseif next(espObjects) then
-            clearEsp()
+loop(1, function()
+    if not S.visual.esp then
+        if next(espObjects) then clearEsp() end
+        return
+    end
+    for _, p in ipairs(Players:GetPlayers()) do
+        local char = p.Character
+        local h = espObjects[p]
+        if p ~= lp and char and (not h or h.Adornee ~= char) then
+            if h then pcall(function() h:Destroy() end) end
+            h = Instance.new("Highlight")
+            h.FillColor = Color3.fromRGB(255, 80, 80)
+            h.FillTransparency = 0.6
+            h.OutlineColor = Color3.new(1, 1, 1)
+            h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            h.Adornee = char
+            h.Parent = char
+            espObjects[p] = h
+        end
+    end
+    for p, h in pairs(espObjects) do
+        if not p.Parent then
+            pcall(function() h:Destroy() end)
+            espObjects[p] = nil
         end
     end
 end)
@@ -422,7 +443,7 @@ end)
 -- TELEPORT & SERVER
 ----------------------------------------------------------------
 local function findPlayer(query)
-    query = query:lower()
+    query = (query or ""):lower()
     if query == "" then return nil end
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= lp and (p.Name:lower():find(query, 1, true) or p.DisplayName:lower():find(query, 1, true)) then
@@ -433,7 +454,8 @@ end
 
 local function teleportToPlayer()
     local p = findPlayer(S.tp.target)
-    local root, targetRoot = getRoot(), p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+    local root = getRoot()
+    local targetRoot = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
     if root and targetRoot then
         root.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 3)
         notify("Teleport", "Ke " .. p.Name)
@@ -463,7 +485,8 @@ local function copyCoords()
     local root = getRoot()
     if root then
         local p = root.Position
-        notify("Koordinat", ("%.1f, %.1f, %.1f%s"):format(p.X, p.Y, p.Z, copy(("%.1f, %.1f, %.1f"):format(p.X, p.Y, p.Z)) and " (disalin)" or ""))
+        local txt = ("%.1f, %.1f, %.1f"):format(p.X, p.Y, p.Z)
+        notify("Koordinat", txt .. (copy(txt) and " (disalin)" or ""))
     end
 end
 
@@ -559,11 +582,10 @@ local function scanWeather()
 end
 
 local function scanDamageSources()
-    local out = {}
-    local keys = { "damage", "dmg", "hurt", "harm", "lava", "kill", "fall", "lightning", "petir", "poison", "racun" }
-    for _, line in ipairs(scanKeys(keys, { { RS, "ReplicatedStorage" }, { lp.PlayerScripts, "Scripts" }, { lp.PlayerGui, "Gui" } })) do
-        table.insert(out, line)
-    end
+    local out = scanKeys(
+        { "damage", "dmg", "hurt", "harm", "lava", "kill", "fall", "lightning", "petir", "poison", "racun" },
+        { { RS, "ReplicatedStorage" }, { lp.PlayerScripts, "Scripts" }, { lp.PlayerGui, "Gui" } }
+    )
     table.insert(out, "--- remote yang baru dikirim ---")
     table.insert(out, #remoteLog > 0 and table.concat(remoteLog, ", ") or "-")
     finishScan("Scan Sumber Damage", out)
@@ -603,19 +625,15 @@ local function normId(id)
     return id
 end
 
-task.spawn(function()
-    while true do
-        task.wait(0.3)
-        if S.flag.on then
-            local head = lp.Character and lp.Character:FindFirstChild("Head")
-            local tag = head and head:FindFirstChild("NameTag")
-            local frame = tag and tag:FindFirstChild("Frame")
-            local detail = frame and frame:FindFirstChild("FrameDetail")
-            local country = detail and detail:FindFirstChild("Country")
-            local img = normId(S.flag.id)
-            if country and img then country.Image = img end
-        end
-    end
+loop(0.3, function()
+    if not S.flag.on then return end
+    local head = lp.Character and lp.Character:FindFirstChild("Head")
+    local tag = head and head:FindFirstChild("NameTag")
+    local frame = tag and tag:FindFirstChild("Frame")
+    local detail = frame and frame:FindFirstChild("FrameDetail")
+    local country = detail and detail:FindFirstChild("Country")
+    local img = normId(S.flag.id)
+    if country and img then country.Image = img end
 end)
 
 ----------------------------------------------------------------
@@ -672,10 +690,14 @@ MoveTab:Slider({
 })
 section(MoveTab, "Lainnya")
 MoveTab:Toggle({ Title = "Noclip", Default = false, Callback = function(v) S.move.noclip = v end })
-MoveTab:Toggle({ Title = "Aktifkan FOV", Default = false, Callback = function(v)
-    S.move.fovOn = v
-    if not v and workspace.CurrentCamera then workspace.CurrentCamera.FieldOfView = 70 end
-end })
+MoveTab:Toggle({
+    Title = "Aktifkan FOV",
+    Default = false,
+    Callback = function(v)
+        S.move.fovOn = v
+        if not v and workspace.CurrentCamera then workspace.CurrentCamera.FieldOfView = 70 end
+    end,
+})
 MoveTab:Slider({
     Title = "Field of View",
     Value = { Min = 40, Max = 120, Default = 70 },
@@ -706,31 +728,45 @@ WeatherTab:Slider({
     Callback = function(v) S.weather.temp = v end,
 })
 section(WeatherTab, "Hujan & Efek")
-WeatherTab:Toggle({ Title = "Matikan Hujan (visual + suara)", Default = false, Callback = function(v) S.weather.noRain = v end })
+WeatherTab:Toggle({ Title = "Anti Hujan (visual + suara + efek)", Default = false, Callback = function(v) S.weather.noRain = v end })
 WeatherTab:Toggle({ Title = "Paksa Cuaca Terang (lokal)", Default = false, Callback = function(v) S.weather.forceClear = v end })
-WeatherTab:Toggle({ Title = "Sembunyikan Damage Indicator", Default = false, Callback = function(v)
-    S.weather.hideDmg = v
-    local di = lp.PlayerGui:FindFirstChild("DamageIndicator")
-    if di then di.Enabled = not v end
-end })
+WeatherTab:Toggle({
+    Title = "Sembunyikan Damage Indicator",
+    Default = false,
+    Callback = function(v)
+        S.weather.hideDmg = v
+        local di = lp.PlayerGui:FindFirstChild("DamageIndicator")
+        if di then di.Enabled = not v end
+    end,
+})
 
 -- Proteksi
 local ProtTab = Window:Tab({ Title = "Proteksi", Icon = "shield" })
 section(ProtTab, "Damage Cuaca")
-ProtTab:Toggle({ Title = "Anti Damage Dingin", Default = false, Callback = function(v)
-    S.anti.cold = v
-    applyHypoBlock(v)
-end })
+ProtTab:Toggle({
+    Title = "Anti Damage Dingin",
+    Default = false,
+    Callback = function(v)
+        S.anti.cold = v
+        applyHypoBlock(v)
+    end,
+})
 ProtTab:Slider({
     Title = "Batas Suhu Minimum",
     Value = { Min = 15, Max = 36, Default = 25 },
     Callback = function(v) S.anti.minTemp = v end,
 })
-ProtTab:Toggle({ Title = "Anti Damage Hujan", Default = false, Callback = function(v) S.weather.noRain = v end })
 section(ProtTab, "Damage Umum")
 ProtTab:Toggle({ Title = "Anti Fall Damage", Default = false, Callback = function(v) S.move.noFall = v end })
 ProtTab:Toggle({ Title = "Health Lock (client)", Default = false, Callback = function(v) S.anti.god = v end })
-ProtTab:Toggle({ Title = "Anti Ragdoll / Jatuh", Default = false, Callback = function(v) S.anti.noRagdoll = v end })
+ProtTab:Toggle({
+    Title = "Anti Ragdoll / Jatuh",
+    Default = false,
+    Callback = function(v)
+        S.anti.noRagdoll = v
+        applyRagdoll(v)
+    end,
+})
 ProtTab:Toggle({ Title = "Blokir Remote Damage", Default = false, Callback = function(v) S.anti.blockRemote = v end })
 section(ProtTab, "Lainnya")
 ProtTab:Toggle({ Title = "Anti AFK", Default = false, Callback = function(v) S.anti.afk = v end })
@@ -738,10 +774,14 @@ ProtTab:Button({ Title = "Salin Log Damage", Desc = "Darah turun + suhu + cuaca 
 
 -- Visual
 local VisualTab = Window:Tab({ Title = "Visual", Icon = "eye" })
-VisualTab:Toggle({ Title = "Fullbright (terang di malam hari)", Default = false, Callback = function(v)
-    S.visual.fullbright = v
-    setFullbright(v)
-end })
+VisualTab:Toggle({
+    Title = "Fullbright (terang di malam hari)",
+    Default = false,
+    Callback = function(v)
+        S.visual.fullbright = v
+        setFullbright(v)
+    end,
+})
 VisualTab:Toggle({ Title = "ESP Pemain", Default = false, Callback = function(v) S.visual.esp = v end })
 
 -- Teleport
@@ -777,5 +817,15 @@ FlagTab:Input({
     Callback = function(v) S.flag.id = v end,
 })
 FlagTab:Toggle({ Title = "Ganti Bendera", Default = false, Callback = function(v) S.flag.on = v end })
+
+----------------------------------------------------------------
+-- CLEANUP (dipanggil otomatis saat script dieksekusi ulang)
+----------------------------------------------------------------
+G.BsjCleanup = function()
+    G.BsjToken = nil
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    clearEsp()
+    pcall(function() Window:Destroy() end)
+end
 
 notify("Bsj Hub", "Script berhasil dimuat")
